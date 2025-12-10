@@ -447,7 +447,14 @@ func (rt *roundTripper) buildHttp3Transport(req *http.Request, addr string) (htt
 		}
 
 		transport := &quic.Transport{Conn: udpConn}
-		return transport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+		conn, err := transport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+		if err != nil {
+			// DialEarly 失败时，需要关闭 UDP 连接，避免泄漏
+			// 注意：如果 DialEarly 成功，quic.Transport 会负责管理连接的生命周期
+			udpConn.Close()
+			return nil, err
+		}
+		return conn, nil
 	}
 
 	// HTTP/3 不使用 HTTP/2 的设置
@@ -487,16 +494,7 @@ func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Respons
 		return resp, nil
 	}
 
-	// HTTP/3 失败，记录错误（用于调试）
-	errStr := err.Error()
-
-	// 检查是否是 context 取消（不应该降级）
-	if req.Context().Err() != nil {
-		return nil, fmt.Errorf("HTTP/3 failed (context cancelled): %w", err)
-	}
-
-	// 检查是否是明确不应该降级的错误类型
-	// 例如：上下文取消错误（不应该降级，应该直接返回）
+	// 检查是否是 context 取消（不应该降级，应该直接返回）
 	if req.Context().Err() != nil {
 		return nil, fmt.Errorf("HTTP/3 failed (context cancelled): %w", err)
 	}
@@ -508,7 +506,7 @@ func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Respons
 	// - 连接错误 (connection refused, connection reset, network is unreachable)
 	// - QUIC/UDP 特定错误 (UDP, QUIC, receive buffer)
 	// - HTTP/3 协议错误 (H3_SETTINGS_ERROR 等)
-	// 
+	//
 	// 对于未知错误，也尝试降级，让 HTTP/2 有机会成功
 
 	// HTTP/3 失败且应该降级，降级到 HTTP/2 或 HTTP/1.1
@@ -523,10 +521,16 @@ func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Respons
 		}
 
 		// 临时禁用 HTTP/3，强制使用 TCP
+		// 注意：需要在持有锁的情况下修改，避免竞态条件
+		h.roundTripper.Lock()
 		originalDisableHttp3 := h.roundTripper.disableHttp3
 		h.roundTripper.disableHttp3 = true
+		h.roundTripper.Unlock()
 		defer func() {
+			// 恢复时需要再次持有锁
+			h.roundTripper.Lock()
 			h.roundTripper.disableHttp3 = originalDisableHttp3
+			h.roundTripper.Unlock()
 		}()
 
 		// 需要先清理可能的缓存连接和缓存连接
