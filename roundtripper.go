@@ -3,6 +3,7 @@ package tls_client
 import (
 	"context"
 	"errors"
+	"io"
 	"fmt"
 	"net"
 	"strconv"
@@ -488,6 +489,20 @@ type http3TransportWithFallback struct {
 func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 尝试使用 HTTP/3
 	// 注意：HTTP/3 Transport 在 RoundTrip 时会尝试建立 QUIC 连接
+	// 重要：如果请求有 body，需要保存 req.GetBody，以便在降级重试时恢复 body
+	var getBody func() (io.ReadCloser, error)
+	if req.Body != nil {
+		// 如果请求已经设置了 GetBody（通常由 http.NewRequest 自动设置），使用它
+		// 如果没有，我们需要在调用 RoundTrip 之前保存 body
+		if req.GetBody != nil {
+			getBody = req.GetBody
+		} else {
+			// 对于没有 GetBody 的请求，我们无法安全地重试，因为 body 可能已经被消费
+			// 但这不应该发生，因为标准库的 http.NewRequest 通常会设置 GetBody
+			// 为了安全，我们仍然尝试，但可能会失败
+		}
+	}
+
 	resp, err := h.h3Transport.RoundTrip(req)
 	if err == nil {
 		// HTTP/3 成功
@@ -497,6 +512,28 @@ func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Respons
 	// 检查是否是 context 取消（不应该降级，应该直接返回）
 	if req.Context().Err() != nil {
 		return nil, fmt.Errorf("HTTP/3 failed (context cancelled): %w", err)
+	}
+
+	// 如果请求有 body 且可能已被消费，需要恢复 body 以便降级重试
+	// HTTP request body 是单次读取流，一旦被读取就不能再次读取
+	// 我们需要使用 GetBody 来获取一个新的 body 副本
+	if req.Body != nil && getBody != nil {
+		newBody, restoreErr := getBody()
+		if restoreErr != nil {
+			// 无法恢复 body，返回原始错误和恢复错误
+			return nil, fmt.Errorf("HTTP/3 failed: %w, and cannot restore request body for fallback: %v", err, restoreErr)
+		}
+		// 关闭旧的 body（如果还没关闭）
+		if req.Body != nil {
+			req.Body.Close()
+		}
+		req.Body = newBody
+	} else if req.Body != nil && getBody == nil {
+		// 有 body 但没有 GetBody，无法安全重试
+		// 这种情况下，HTTP/3 可能已经部分消费了 body，降级重试可能会失败
+		// 但我们仍然尝试，因为有些情况下可能 body 还没有被读取（比如连接失败很快）
+		// 返回更详细的错误信息
+		return nil, fmt.Errorf("HTTP/3 failed: %w, and request body cannot be restored for fallback (no GetBody function)", err)
 	}
 
 	// 对于所有其他 HTTP/3 错误，采用保守策略：尝试降级到 HTTP/2/HTTP/1.1
