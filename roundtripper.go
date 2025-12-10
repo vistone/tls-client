@@ -495,30 +495,21 @@ func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Respons
 		return nil, fmt.Errorf("HTTP/3 failed (context cancelled): %w", err)
 	}
 
-	// 检查是否是连接错误（应该降级到 HTTP/2）
-	// 包括：超时、连接拒绝、网络不可达、UDP 缓冲区问题等
-	shouldFallback := false
-	if strings.Contains(errStr, "timeout") ||
-		strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "no recent network activity") ||
-		strings.Contains(errStr, "i/o timeout") ||
-		strings.Contains(errStr, "connection reset") ||
-		strings.Contains(errStr, "network is unreachable") ||
-		strings.Contains(errStr, "UDP") ||
-		strings.Contains(errStr, "QUIC") ||
-		strings.Contains(errStr, "receive buffer") {
-				shouldFallback = true
-			}
-
-	// 如果错误不明显，默认也尝试降级（更保守的策略）
-	if !shouldFallback {
-		// 对于未知错误，也尝试降级，让 HTTP/2 有机会成功
-		shouldFallback = true
+	// 检查是否是明确不应该降级的错误类型
+	// 例如：上下文取消错误（不应该降级，应该直接返回）
+	if req.Context().Err() != nil {
+		return nil, fmt.Errorf("HTTP/3 failed (context cancelled): %w", err)
 	}
 
-	if !shouldFallback {
-		return nil, fmt.Errorf("HTTP/3 failed (non-fallback error): %w", err)
-	}
+	// 对于所有其他 HTTP/3 错误，采用保守策略：尝试降级到 HTTP/2/HTTP/1.1
+	// 这样可以提高兼容性，因为有些错误可能是 QUIC/UDP 特有的，TCP 连接可能成功
+	// 已知应该降级的错误包括：
+	// - 超时错误 (timeout, no recent network activity, i/o timeout)
+	// - 连接错误 (connection refused, connection reset, network is unreachable)
+	// - QUIC/UDP 特定错误 (UDP, QUIC, receive buffer)
+	// - HTTP/3 协议错误 (H3_SETTINGS_ERROR 等)
+	// 
+	// 对于未知错误，也尝试降级，让 HTTP/2 有机会成功
 
 	// HTTP/3 失败且应该降级，降级到 HTTP/2 或 HTTP/1.1
 	// 使用 sync.Once 确保只创建一次 fallback transport
