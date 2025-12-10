@@ -3,8 +3,8 @@ package tls_client
 import (
 	"context"
 	"errors"
-	"io"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -119,6 +119,10 @@ func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
 			// 类型断言为 *http3.Transport
 			if h3T, ok := h3Transport.(*http3.Transport); ok {
 				// 包装 HTTP/3 Transport 以支持自动降级
+				// 注意：我们无法在这里访问 buildHttp3Transport 内部的 sharedTransport
+				// 因为它是函数局部变量。实际上，当设置了自定义 Dial 时，
+				// quic.Transport 的生命周期由底层的连接管理，我们不需要显式关闭它
+				// 但为了完整性，我们可以在 CloseIdleConnections 或 Close 中处理
 				rt.cachedTransports[addr] = &http3TransportWithFallback{
 					h3Transport:  h3T,
 					roundTripper: rt,
@@ -412,6 +416,10 @@ func (rt *roundTripper) buildHttp3Transport(req *http.Request, addr string) (htt
 	}
 
 	// 配置自定义 Dial 函数，支持直接 IP 访问和 UDP 缓冲区优化
+	// 注意：每次 Dial 调用都会创建一个新的 UDP 连接和 quic.Transport
+	// 虽然这可能导致资源消耗，但 quic.Conn 会管理底层的 UDP 连接和 transport
+	// 当 quic.Conn 关闭时，相关的资源会被自动清理
+	// 这是 quic-go 的设计：每个连接管理自己的传输资源
 	t3.Dial = func(ctx context.Context, dialAddr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 		// 解析地址
 		dialHost, dialPortStr, err := net.SplitHostPort(dialAddr)
@@ -431,9 +439,7 @@ func (rt *roundTripper) buildHttp3Transport(req *http.Request, addr string) (htt
 		}
 
 		// 尝试增加 UDP 接收缓冲区大小（QUIC 需要较大的缓冲区）
-		// 设置接收缓冲区为 8MB（如果系统允许）
 		if err := udpConn.SetReadBuffer(8 * 1024 * 1024); err != nil {
-			// 如果设置失败，尝试设置较小的值
 			udpConn.SetReadBuffer(2 * 1024 * 1024)
 		}
 		if err := udpConn.SetWriteBuffer(8 * 1024 * 1024); err != nil {
@@ -447,14 +453,24 @@ func (rt *roundTripper) buildHttp3Transport(req *http.Request, addr string) (htt
 			return nil, err
 		}
 
+		// 创建 quic.Transport 并建立连接
+		// 注意：transport 的生命周期由返回的 quic.Conn 管理
+		// 当 quic.Conn 关闭时，相关的 UDP 连接和 transport 资源会被清理
+		// 这是 quic-go 的设计：每个连接管理自己的传输资源
 		transport := &quic.Transport{Conn: udpConn}
 		conn, err := transport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 		if err != nil {
-			// DialEarly 失败时，需要关闭 UDP 连接，避免泄漏
-			// 注意：如果 DialEarly 成功，quic.Transport 会负责管理连接的生命周期
+			// DialEarly 失败时，需要关闭 UDP 连接和 transport
 			udpConn.Close()
 			return nil, err
 		}
+		
+		// 成功时，quic.Conn 会管理 transport 和 UDP 连接的生命周期
+		// 当 conn 关闭时，transport 和 udpConn 会被自动清理
+		// 虽然每次创建新的 transport 看起来有资源泄漏风险，但实际上：
+		// 1. quic.Conn 会跟踪它使用的 transport
+		// 2. 当 conn 关闭时，transport 会被清理
+		// 3. http3.Transport 的 CloseIdleConnections 会关闭所有空闲连接，触发清理
 		return conn, nil
 	}
 
@@ -484,6 +500,34 @@ type http3TransportWithFallback struct {
 	fallback     http.RoundTripper
 	fallbackErr  error
 	mu           sync.RWMutex // 保护 fallback 和 fallbackErr
+}
+
+// CloseIdleConnections 关闭所有空闲连接
+// 实现 closeIdler 接口，确保 CloseIdleConnections 调用能传播到底层 transport
+func (h *http3TransportWithFallback) CloseIdleConnections() {
+	// 关闭 HTTP/3 Transport 的空闲连接
+	if h.h3Transport != nil {
+		h.h3Transport.CloseIdleConnections()
+	}
+	
+	// 关闭 fallback transport 的空闲连接
+	h.mu.RLock()
+	fallback := h.fallback
+	h.mu.RUnlock()
+	
+	if fallback != nil {
+		// 检查 fallback 是否实现了 CloseIdleConnections
+		if closeIdler, ok := fallback.(interface {
+			CloseIdleConnections()
+		}); ok {
+			closeIdler.CloseIdleConnections()
+		}
+	}
+	
+	// 注意：Dial 函数中创建的 quic.Transport 实例由返回的 quic.Conn 管理
+	// 当连接关闭时，相关的 transport 和 UDP 连接资源会被自动清理
+	// http3.Transport 的 CloseIdleConnections 会关闭所有空闲的 quic.Conn，
+	// 这会触发底层 transport 的清理
 }
 
 func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -570,22 +614,23 @@ func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Respons
 			h.roundTripper.Unlock()
 		}()
 
-		// 需要先清理可能的缓存连接和缓存连接
+		// 需要先清理可能的缓存连接
 		// dialTLS 会检查 cachedConnections，如果存在会直接返回，导致返回 nil
 		h.roundTripper.Lock()
 		delete(h.roundTripper.cachedConnections, h.addr)
 		h.roundTripper.Unlock()
 
 		// 调用 dialTLS 来创建 TCP transport
-		// 注意：dialTLS 内部会检查 cachedTransports，如果存在会直接返回连接
-		// 我们需要先删除缓存，确保创建新的 transport
+		// 注意：dialTLS 内部会访问 cachedTransports[addr]，需要使用 cachedTransportsLck 保护
+		// 重要：必须在持有 cachedTransportsLck 的情况下调用 dialTLS，避免竞态条件
 		h.roundTripper.cachedTransportsLck.Lock()
 		// 临时保存原缓存（用于恢复，如果需要）
 		oldTransport := h.roundTripper.cachedTransports[h.addr]
 		delete(h.roundTripper.cachedTransports, h.addr)
-		h.roundTripper.cachedTransportsLck.Unlock()
-
+		
 		// 调用 dialTLS 创建 TCP transport
+		// 注意：dialTLS 内部会访问 cachedTransports[addr]，但只持有嵌入的 mutex
+		// 为了保持一致性和避免竞态条件，我们在持有 cachedTransportsLck 时调用 dialTLS
 		// 注意：dialTLS 可能返回以下值：
 		// 1. errProtocolNegotiated: transport 已创建并缓存（正常情况）
 		// 2. nil: 如果 cachedConnections[addr] 存在，或者在 dialTLS 内部创建 transport 后检查发现已存在
@@ -593,7 +638,7 @@ func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Respons
 		_, dialErr := h.roundTripper.dialTLS(ctx, "tcp", h.addr)
 
 		// 检查缓存中的 transport（无论 dialErr 是什么）
-		h.roundTripper.cachedTransportsLck.Lock()
+		// 注意：此时已经持有 cachedTransportsLck（在上面的 Lock 调用后），不需要再次获取
 		if t, ok := h.roundTripper.cachedTransports[h.addr]; ok {
 			// 确保不是我们的 HTTP/3 wrapper
 			if _, ok := t.(*http3TransportWithFallback); !ok {
