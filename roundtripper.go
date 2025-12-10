@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/fhttp/http2"
+	"github.com/bogdanfinn/quic-go-utls"
 	"github.com/bogdanfinn/quic-go-utls/http3"
 	"github.com/bogdanfinn/tls-client/bandwidth"
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -105,6 +107,32 @@ func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
 		return fmt.Errorf("invalid URL scheme: [%v]", req.URL.Scheme)
 	}
 
+	// 修复：首先尝试 HTTP/3 (QUIC/UDP)，而不是在 TCP 上协商
+	// HTTP/3 使用 QUIC (UDP)，在 TCP 连接上无法协商出 "h3" 协议
+	// 因此我们需要先尝试直接使用 HTTP/3 Transport
+	// 注意：如果 HTTP/3 连接失败，RoundTrip 会返回错误，我们需要在 RoundTrip 层处理降级
+	if !rt.disableHttp3 {
+		// 尝试创建 HTTP/3 Transport (QUIC/UDP)
+		h3Transport, err := rt.buildHttp3Transport(req, addr)
+		if err == nil {
+			// 类型断言为 *http3.Transport
+			if h3T, ok := h3Transport.(*http3.Transport); ok {
+				// 包装 HTTP/3 Transport 以支持自动降级
+				rt.cachedTransports[addr] = &http3TransportWithFallback{
+					h3Transport:  h3T,
+					roundTripper: rt,
+					addr:         addr,
+				}
+				return nil
+			}
+			// 如果不是 *http3.Transport，直接使用
+			rt.cachedTransports[addr] = h3Transport
+			return nil
+		}
+		// HTTP/3 创建失败，继续使用 TCP (HTTP/2 或 HTTP/1.1)
+	}
+
+	// 降级到 TCP (HTTP/2 或 HTTP/1.1)
 	_, err := rt.dialTLS(req.Context(), "tcp", addr)
 	switch err {
 	case errProtocolNegotiated:
@@ -173,7 +201,13 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 		return nil, err
 	}
 
+	// 检查是否已经有缓存的 transport
+	// 如果有，说明是在已有的 transport 上创建新连接，直接返回连接
+	// 注意：这个检查在创建 transport 之后，如果在 switch 中已经设置了 transport，
+	// 这里会返回 conn, nil 而不是继续执行到返回 errProtocolNegotiated
 	if rt.cachedTransports[addr] != nil {
+		// 注意：这里返回 nil 是正确的行为，表示连接已建立，transport 已存在
+		// 调用者应该检查 err == nil 的情况（这不应该在 getTransport 中发生）
 		return conn, nil
 	}
 
@@ -283,24 +317,14 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 			TLSClientConfig: utlsConfig,
 		}
 
-		if rt.settings == nil {
-			// when we not provide a map of custom http2 settings
-			t3.AdditionalSettings = map[uint64]uint64{
-				uint64(http2.SettingMaxConcurrentStreams): 1000,
-				uint64(http2.SettingMaxFrameSize):         16384,
-				uint64(http2.SettingInitialWindowSize):    6291456,
-				uint64(http2.SettingHeaderTableSize):      65536,
-			}
-		} else {
-			// convert settings map from uint32 to uint64
-			convertedSettings := map[uint64]uint64{}
-			for key, value := range rt.settings {
-				convertedSettings[uint64(key)] = uint64(value)
-			}
-
-			// use custom settings
-			t3.AdditionalSettings = convertedSettings
-		}
+		// HTTP/3 不使用 HTTP/2 的设置
+		// HTTP/3 的 AdditionalSettings 应该是 HTTP/3 特定的设置 ID，而不是 HTTP/2 的设置 ID
+		// 如果设置 HTTP/2 的设置（如 SETTINGS_MAX_CONCURRENT_STREAMS, ID 4），会导致错误：
+		// "H3_SETTINGS_ERROR: received HTTP/2 specific setting in HTTP/3 session"
+		// 因此，我们不设置 AdditionalSettings，让 HTTP/3 Transport 使用默认设置
+		// 如果将来需要自定义 HTTP/3 设置，应该使用 HTTP/3 特定的设置 ID
+		// 注意：rt.settings 是 HTTP/2 的设置，不适用于 HTTP/3
+		t3.AdditionalSettings = nil
 
 		if rt.transportOptions != nil {
 			t3.DisableCompression = rt.transportOptions.DisableCompression
@@ -356,6 +380,229 @@ func (rt *roundTripper) buildHttp1Transport() *http.Transport {
 	}
 
 	return t
+}
+
+// buildHttp3Transport 创建 HTTP/3 Transport (QUIC/UDP)
+func (rt *roundTripper) buildHttp3Transport(req *http.Request, addr string) (http.RoundTripper, error) {
+	utlsConfig := &tls.Config{
+		ClientSessionCache: rt.clientSessionCache,
+		InsecureSkipVerify: rt.insecureSkipVerify,
+		OmitEmptyPsk:       true,
+	}
+	if rt.transportOptions != nil {
+		utlsConfig.RootCAs = rt.transportOptions.RootCAs
+		utlsConfig.KeyLogWriter = rt.transportOptions.KeyLogWriter
+	}
+
+	var host string
+	var err error
+	if host, _, err = net.SplitHostPort(addr); err != nil {
+		host = addr
+	}
+
+	if rt.serverNameOverwrite != "" {
+		utlsConfig.ServerName = rt.serverNameOverwrite
+	} else {
+		utlsConfig.ServerName = host
+	}
+
+	t3 := http3.Transport{
+		TLSClientConfig: utlsConfig,
+	}
+
+	// 配置自定义 Dial 函数，支持直接 IP 访问和 UDP 缓冲区优化
+	t3.Dial = func(ctx context.Context, dialAddr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+		// 解析地址
+		dialHost, dialPortStr, err := net.SplitHostPort(dialAddr)
+		if err != nil {
+			return nil, err
+		}
+
+		dialPort, err := net.LookupPort("udp", dialPortStr)
+		if err != nil {
+			return nil, err
+		}
+
+		// 创建 UDP 连接
+		udpConn, err := net.ListenUDP("udp", nil)
+		if err != nil {
+			return nil, err
+		}
+
+		// 尝试增加 UDP 接收缓冲区大小（QUIC 需要较大的缓冲区）
+		// 设置接收缓冲区为 8MB（如果系统允许）
+		if err := udpConn.SetReadBuffer(8 * 1024 * 1024); err != nil {
+			// 如果设置失败，尝试设置较小的值
+			udpConn.SetReadBuffer(2 * 1024 * 1024)
+		}
+		if err := udpConn.SetWriteBuffer(8 * 1024 * 1024); err != nil {
+			udpConn.SetWriteBuffer(2 * 1024 * 1024)
+		}
+
+		// 解析目标 UDP 地址
+		udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(dialHost, strconv.Itoa(dialPort)))
+		if err != nil {
+			udpConn.Close()
+			return nil, err
+		}
+
+		transport := &quic.Transport{Conn: udpConn}
+		return transport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+	}
+
+	// HTTP/3 不使用 HTTP/2 的设置
+	// HTTP/3 的 AdditionalSettings 应该是 HTTP/3 特定的设置 ID，而不是 HTTP/2 的设置 ID
+	// 如果设置 HTTP/2 的设置（如 SETTINGS_MAX_CONCURRENT_STREAMS, ID 4），会导致错误：
+	// "H3_SETTINGS_ERROR: received HTTP/2 specific setting in HTTP/3 session"
+	// 因此，我们不设置 AdditionalSettings，让 HTTP/3 Transport 使用默认设置
+	// 如果将来需要自定义 HTTP/3 设置，应该使用 HTTP/3 特定的设置 ID
+	// 注意：rt.settings 是 HTTP/2 的设置，不适用于 HTTP/3
+	t3.AdditionalSettings = nil
+
+	if rt.transportOptions != nil {
+		t3.DisableCompression = rt.transportOptions.DisableCompression
+		t3.MaxResponseHeaderBytes = rt.transportOptions.MaxResponseHeaderBytes
+	}
+
+	return &t3, nil
+}
+
+// http3TransportWithFallback 包装 HTTP/3 Transport，支持失败时自动降级到 HTTP/2
+type http3TransportWithFallback struct {
+	h3Transport  *http3.Transport
+	roundTripper *roundTripper
+	addr         string
+	fallbackOnce sync.Once
+	fallback     http.RoundTripper
+	fallbackErr  error
+	mu           sync.RWMutex // 保护 fallback 和 fallbackErr
+}
+
+func (h *http3TransportWithFallback) RoundTrip(req *http.Request) (*http.Response, error) {
+	// 尝试使用 HTTP/3
+	// 注意：HTTP/3 Transport 在 RoundTrip 时会尝试建立 QUIC 连接
+	resp, err := h.h3Transport.RoundTrip(req)
+	if err == nil {
+		// HTTP/3 成功
+		return resp, nil
+	}
+
+	// HTTP/3 失败，记录错误（用于调试）
+	errStr := err.Error()
+
+	// 检查是否是 context 取消（不应该降级）
+	if req.Context().Err() != nil {
+		return nil, fmt.Errorf("HTTP/3 failed (context cancelled): %w", err)
+	}
+
+	// 检查是否是连接错误（应该降级到 HTTP/2）
+	// 包括：超时、连接拒绝、网络不可达、UDP 缓冲区问题等
+	shouldFallback := false
+	if strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "no recent network activity") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "network is unreachable") ||
+		strings.Contains(errStr, "UDP") ||
+		strings.Contains(errStr, "QUIC") ||
+		strings.Contains(errStr, "receive buffer") {
+				shouldFallback = true
+			}
+
+	// 如果错误不明显，默认也尝试降级（更保守的策略）
+	if !shouldFallback {
+		// 对于未知错误，也尝试降级，让 HTTP/2 有机会成功
+		shouldFallback = true
+	}
+
+	if !shouldFallback {
+		return nil, fmt.Errorf("HTTP/3 failed (non-fallback error): %w", err)
+	}
+
+	// HTTP/3 失败且应该降级，降级到 HTTP/2 或 HTTP/1.1
+	// 使用 sync.Once 确保只创建一次 fallback transport
+	h.fallbackOnce.Do(func() {
+		// 直接构建 TCP transport (HTTP/2 或 HTTP/1.1)
+		// 不通过 getTransport，而是直接构建，避免缓存冲突
+
+		ctx := req.Context()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+
+		// 临时禁用 HTTP/3，强制使用 TCP
+		originalDisableHttp3 := h.roundTripper.disableHttp3
+		h.roundTripper.disableHttp3 = true
+		defer func() {
+			h.roundTripper.disableHttp3 = originalDisableHttp3
+		}()
+
+		// 需要先清理可能的缓存连接和缓存连接
+		// dialTLS 会检查 cachedConnections，如果存在会直接返回，导致返回 nil
+		h.roundTripper.Lock()
+		delete(h.roundTripper.cachedConnections, h.addr)
+		h.roundTripper.Unlock()
+
+		// 调用 dialTLS 来创建 TCP transport
+		// 注意：dialTLS 内部会检查 cachedTransports，如果存在会直接返回连接
+		// 我们需要先删除缓存，确保创建新的 transport
+		h.roundTripper.cachedTransportsLck.Lock()
+		// 临时保存原缓存（用于恢复，如果需要）
+		oldTransport := h.roundTripper.cachedTransports[h.addr]
+		delete(h.roundTripper.cachedTransports, h.addr)
+		h.roundTripper.cachedTransportsLck.Unlock()
+
+		// 调用 dialTLS 创建 TCP transport
+		// 注意：dialTLS 可能返回以下值：
+		// 1. errProtocolNegotiated: transport 已创建并缓存（正常情况）
+		// 2. nil: 如果 cachedConnections[addr] 存在，或者在 dialTLS 内部创建 transport 后检查发现已存在
+		// 3. 其他错误: 连接失败
+		_, dialErr := h.roundTripper.dialTLS(ctx, "tcp", h.addr)
+
+		// 检查缓存中的 transport（无论 dialErr 是什么）
+		h.roundTripper.cachedTransportsLck.Lock()
+		if t, ok := h.roundTripper.cachedTransports[h.addr]; ok {
+			// 确保不是我们的 HTTP/3 wrapper
+			if _, ok := t.(*http3TransportWithFallback); !ok {
+				// 找到了非 HTTP/3 的 transport（TCP transport），使用它作为 fallback
+				h.fallback = t
+			} else {
+				// 仍然是 HTTP/3 wrapper，说明清理失败或并发问题
+				// 恢复原缓存并使用 HTTP/1.1 transport 作为最后的 fallback
+				h.roundTripper.cachedTransports[h.addr] = oldTransport
+				h.fallback = h.roundTripper.buildHttp1Transport()
+			}
+		} else {
+			// 没有 transport，根据 dialErr 决定
+			if dialErr == errProtocolNegotiated {
+				// 应该是这种情况，但没有 transport，说明有问题
+				h.roundTripper.cachedTransports[h.addr] = oldTransport
+				h.fallbackErr = fmt.Errorf("dialTLS returned errProtocolNegotiated but no transport was cached")
+			} else if dialErr == nil {
+				// dialTLS 返回 nil，但没有 transport，可能是并发问题
+				// 使用 HTTP/1.1 transport 作为 fallback
+				h.roundTripper.cachedTransports[h.addr] = oldTransport
+				h.fallback = h.roundTripper.buildHttp1Transport()
+			} else {
+				// 连接失败，恢复缓存并使用 HTTP/1.1 transport 作为 fallback
+				h.roundTripper.cachedTransports[h.addr] = oldTransport
+				h.fallback = h.roundTripper.buildHttp1Transport()
+			}
+		}
+		h.roundTripper.cachedTransportsLck.Unlock()
+	})
+
+	if h.fallbackErr != nil {
+		return nil, fmt.Errorf("HTTP/3 failed: %v, fallback failed: %v", err, h.fallbackErr)
+	}
+
+	if h.fallback != nil {
+		// 使用 fallback transport 重试请求
+		return h.fallback.RoundTrip(req)
+	}
+
+	return nil, fmt.Errorf("HTTP/3 failed: %v, and no fallback transport available", err)
 }
 
 func (rt *roundTripper) dialTLSHTTP2(network, addr string, _ *tls.Config) (net.Conn, error) {
